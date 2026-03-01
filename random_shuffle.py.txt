@@ -1,0 +1,30 @@
+import os
+import random
+import shutil
+
+# 설정
+source = r"C:\Users\user\Desktop\ves\train_masks"
+output = r"C:\Users\user\Desktop\ves\train_masks_shuffled"
+
+# 파일 리스트
+files = sorted([f for f in os.listdir(source) if f.endswith('.tif')])
+print(f"원본: {len(files)}개 파일")
+
+# 셔플
+random.shuffle(files)
+print("셔플 완료!")
+
+# 새 폴더에 복사
+os.makedirs(output, exist_ok=True)
+
+for i, f in enumerate(files):
+    src = os.path.join(source, f)
+    # 순서번호를 파일명 앞에 붙임
+    dst = os.path.join(output, f"{i:06d}_{f}")
+    shutil.copy(src, dst)
+    
+    if (i + 1) % 100 == 0:
+        print(f"{i+1}/{len(files)} 완료")
+
+print(f"✅ {output}에 섞인 파일들이 저장됨")
+print(f"원본은 {source}에 그대로 유지됨")

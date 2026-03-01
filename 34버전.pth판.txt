@@ -1,0 +1,160 @@
+import os
+import zipfile
+import pandas as pd
+import numpy as np
+import tifffile
+import torch
+import torch.nn as nn
+import gc
+from tqdm import tqdm
+from scipy.ndimage import binary_closing
+
+# ====================================================
+
+class Vesuvius3DUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        def conv_block_3d(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv3d(in_c, out_c, kernel_size=3, padding=1),
+                nn.BatchNorm3d(out_c),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(out_c, out_c, kernel_size=3, padding=1),
+                nn.BatchNorm3d(out_c),
+                nn.ReLU(inplace=True)
+            )
+        self.enc1 = conv_block_3d(1, 16)
+        self.pool = nn.MaxPool3d(kernel_size=(1, 2, 2))
+        self.enc2 = conv_block_3d(16, 32)
+        self.up = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear', align_corners=True)
+        self.dec = conv_block_3d(32 + 16, 16)
+        self.final = nn.Sequential(
+            nn.Conv3d(16, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        d = self.up(e2)
+        d = torch.cat([d, e1], dim=1)
+        out = self.dec(d)
+        return self.final(out)
+
+# ====================================================
+# 2. 사용자 보조 규칙 완벽 반영 (Rule 1 & 2 통합)
+# ====================================================
+def apply_vesuvius_rules(vol):
+    Z, Y, X = vol.shape
+    out_vol = vol.copy()
+
+    # [Rational Bridge: 복원 로직]
+    for z in range(Z):
+        p1, p25 = vol[z, :-4, :-4], vol[z, 4:, 4:]
+        p5, p21 = vol[z, :-4, 4:], vol[z, 4:, :-4]
+        p7, p9 = vol[z, 1:-3, 1:-3], vol[z, 1:-3, 3:-1]
+        p17, p19 = vol[z, 3:-1, 1:-3], vol[z, 3:-1, 3:-1]
+        
+        restore_cond = ((p1 & p25) | (p5 & p21)) & ((p7 & p9) | (p17 & p19))
+        out_vol[z, 2:-2, 2:-2][restore_cond == 1] = 1
+
+    # [Rule 1 & 2: 제거 로직 (연속성 및 지지 판정)]
+    # z run length 계산을 위해 shift 연산 사용
+    for z in range(1, Z - 1):
+        # 1번 규칙: z 연속 길이 >= 3, xy 이웃 8방향 전부 0일 때 중간 제거
+        is_pillar = (vol[z-1] == 1) & (vol[z] == 1) & (vol[z+1] == 1)
+        
+        # 8방향 이웃 합 계산
+        neighbors_sum = (
+            vol[z, :-2, :-2] + vol[z, :-2, 1:-1] + vol[z, :-2, 2:] +
+            vol[z, 1:-1, :-2] +                    vol[z, 1:-1, 2:] +
+            vol[z, 2:, :-2] + vol[z, 2:, 1:-1] + vol[z, 2:, 2:]
+        )
+        # xy 지지 판정에 "이전/다음 z" 1칸 포함 (사용자 요청 사항)
+        z_neighbors = (
+            vol[z-1, 1:-1, 1:-1] + vol[z+1, 1:-1, 1:-1]
+        )
+        
+        # Rule 1 적용
+        rule1_mask = (is_pillar[1:-1, 1:-1]) & (neighbors_sum == 0) & (z_neighbors > 0)
+        out_vol[z, 1:-1, 1:-1][rule1_mask] = 0
+
+        # 2번 규칙: L >= 4일 때 중간 slice만 제거 (양 끝 유지)
+        if z > 1 and z < Z-2:
+            is_long_run = (vol[z-2]==1) & (vol[z-1]==1) & (vol[z]==1) & (vol[z+1]==1)
+            out_vol[z][is_long_run == 1] = 0
+
+    # 마무리 3x3 Closing
+    for z in range(Z):
+        out_vol[z] = binary_closing(out_vol[z], structure=np.ones((3,3))).astype(np.uint8)
+        
+    return out_vol
+
+# ====================================================
+# 3. 최적화된 실행 함수 (RAM 30GB 방어)
+# ====================================================
+def run_gpu_inference_optimized():
+    INPUT_DIR = "/kaggle/input/vesuvius-challenge-surface-detection"
+    TEST_CSV = os.path.join(INPUT_DIR, "test.csv")
+    TEST_IMG_DIR = os.path.join(INPUT_DIR, "test_images")
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    PATCH_SIZE = 256
+    Z_PATCH = 16 
+    THRESHOLD = 0.45
+ 
+#우측 사이드바 'Data' 탭에서 업로드하신 모델 데이터셋을 찾아 **'Copy file path'**를 한 뒤, 그 경로를 ckpt = torch.load("여기에")에 정확히 붙여넣으셔야 합니다.
+
+    model = Vesuvius3DUNet().to(DEVICE)
+    ckpt = torch.load("/kaggle/input/first-pth/ves_25d_slice5.pth", map_location=DEVICE)
+    model.load_state_dict(ckpt)
+    model.eval()
+    
+    test_df = pd.read_csv(TEST_CSV)
+    tif_files = []
+
+    for _, row in tqdm(test_df.iterrows(), total=len(test_df)):
+        img_id = str(row["id"])
+        img_path = os.path.join(TEST_IMG_DIR, f"{img_id}.tif")
+        
+        with tifffile.TiffFile(img_path) as tif:
+            series = tif.series[0]
+            z_dim, h_img, w_img = series.shape
+            raw_pred_vol = np.zeros((z_dim, h_img, w_img), dtype=np.uint8)
+
+            for z_s in range(0, z_dim, Z_PATCH):
+                z_e = min(z_s + Z_PATCH, z_dim)
+                chunk = np.stack([series.asarray(key=zi) for zi in range(z_s, z_e)]).astype(np.float32)
+                chunk = (chunk - chunk.min()) / (chunk.max() - chunk.min() + 1e-6)
+
+                for h in range(0, h_img, PATCH_SIZE):
+                    for w in range(0, w_img, PATCH_SIZE):
+                        h_e, w_e = min(h+PATCH_SIZE, h_img), min(w+PATCH_SIZE, w_img)
+                        patch = torch.from_numpy(chunk[:, h:h_e, w:w_e]).unsqueeze(0).unsqueeze(0).to(DEVICE)
+                        
+                        with torch.no_grad():
+                            with torch.cuda.amp.autocast():
+                                pred = model(patch)
+                            raw_pred_vol[z_s:z_e, h:h_e, w:w_e] = (pred[0, 0] > THRESHOLD).cpu().numpy().astype(np.uint8)
+                
+                del chunk
+                gc.collect()
+
+            final_vol = apply_vesuvius_rules(raw_pred_vol)
+            final_vol *= 255
+            
+            out_name = f"{img_id}.tif"
+            tifffile.imwrite(out_name, final_vol, bigtiff=True)
+            tif_files.append(out_name)
+            
+            del raw_pred_vol, final_vol
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    with zipfile.ZipFile("submission.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in tif_files:
+            zf.write(f, arcname=f)
+            os.remove(f)
+
+if __name__ == "__main__":
+    run_gpu_inference_optimized()
+    print("✅ 모든 에러를 극복하고 제출 파일 생성을 완료했습니다!")

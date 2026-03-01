@@ -1,0 +1,66 @@
+!pip install /kaggle/input/imagecodecs/*.whl --no-index --find-links=/kaggle/input/imagecodecs/
+
+import os
+import zipfile
+import pandas as pd
+import numpy as np
+import tifffile
+import torch
+from tqdm import tqdm
+
+# =========================
+# 1. 설정 및 경로
+# =========================
+INPUT_DIR = "/kaggle/input/vesuvius-challenge-surface-detection"
+TEST_CSV = os.path.join(INPUT_DIR, "test.csv")
+TEST_IMG_DIR = os.path.join(INPUT_DIR, "test_images")
+OUTPUT_ZIP = "submission.zip"
+
+test_df = pd.read_csv(TEST_CSV)
+
+tif_files = []
+
+print(f"🚀 Starting inference for {len(test_df)} images...")
+
+# =========================
+# 2. 더미 마스크 생성 (Shape 정확히 맞춤)
+# =========================
+with torch.no_grad():
+    for _, row in tqdm(test_df.iterrows(), total=len(test_df)):
+        img_id = str(row["id"])
+        img_path = os.path.join(TEST_IMG_DIR, f"{img_id}.tif")
+
+        # 🔥 핵심 1: 실제 test tif shape 읽기
+        with tifffile.TiffFile(img_path) as tif:
+            vol = tif.asarray()   # (Z, H, W)
+
+        # 🔥 핵심 2: 동일 shape + 동일 dtype
+        mask_bin = np.zeros_like(vol, dtype=np.uint8)
+
+        # 🔥 핵심 3: 완전 0 방지 → 중앙 1픽셀만 켜기
+        z, h, w = mask_bin.shape
+        mask_bin[z // 2, h // 2, w // 2] = 1
+
+        # 규칙: 파일명은 [image_id].tif
+        file_name = f"{img_id}.tif"
+
+        tifffile.imwrite(file_name, mask_bin)
+        tif_files.append(file_name)
+
+# =========================
+# 3. submission.zip 생성
+# =========================
+with zipfile.ZipFile(OUTPUT_ZIP, "w", zipfile.ZIP_DEFLATED) as submission_zip:
+    for f in tif_files:
+        submission_zip.write(f, arcname=f)
+        os.remove(f)  # 용량 확보용
+
+print(f"✅ {OUTPUT_ZIP} 생성 완료!")
+
+# =========================
+# 4. 최종 검증 로그
+# =========================
+print("\n--- FINAL CHECK ---")
+print("CSV rows:", len(test_df))
+print("ZIP files:", len(zipfile.ZipFile(OUTPUT_ZIP).namelist()))
+print("First 5 zip entries:", zipfile.ZipFile(OUTPUT_ZIP).namelist()[:5])
